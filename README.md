@@ -1,36 +1,227 @@
-## Case Study: Real-time Editor App - A collaborative text editor
+# Real-Time Collaborative Editor
 
-### The Problem
+A real-time collaborative text editor that enables multiple users to edit the same document simultaneously with low-latency synchronization and reliable server-side state management.
 
-Building a collaborative editor is straightforward until multiple users type simultaneously. The naive approach — every client broadcasts its delta and every other client applies it directly — breaks down under real-world latency. Two users editing the same region at the same time produce deltas that are each valid against their local state but conflict when applied out of order on a peer. The result is silent document corruption.
+Built with **React, Node.js, Socket.IO, Quill.js, Redis, and Docker**.
 
-A second problem emerges at scale: if every connected user independently saves the document on a fixed interval, the Redis write rate grows linearly with the number of users. Ten users editing simultaneously means ten redundant full-document writes every two seconds — all writing the same content.
+## Features
 
-### Key Technical Decisions
+* **Real-time collaboration** — Multiple users can edit the same document simultaneously with changes synchronized through WebSockets.
+* **Server-authoritative document state** — Incoming Quill Deltas are composed on the server before being broadcast to connected clients.
+* **Operational Transform** — Uses Quill's Delta composition model to maintain consistent document state during concurrent edits.
+* **Efficient persistence** — Document saves are triggered using a **2-second debounce**, reducing redundant Redis writes during active editing.
+* **Redis caching & persistence** — Documents use namespaced keys with a **24-hour TTL** for automatic cleanup of inactive data.
+* **Input validation** — Socket events validate document IDs, usernames, Deltas, and cursor ranges before processing.
+* **Connection recovery** — Reconnecting clients automatically rejoin the document and reload the latest server state.
+* **Docker support** — Frontend, backend, and Redis can be run together using Docker Compose.
 
-**Server-side delta composition**
+## Architecture
 
-Rather than treating the server as a dumb relay, it maintains an authoritative in-memory `Delta` per document using Quill's operational transform model. Every incoming `text-change` is composed onto this canonical state before being rebroadcast. This means the server always holds the ground-truth document regardless of client timing, and saves are always derived from that authoritative state rather than trusting any individual client's payload.
-
+```text
+                    ┌───────────────────┐
+                    │    React + Quill  │
+                    │      Client A     │
+                    └─────────┬─────────┘
+                              │
+                              │ Socket.IO
+                              ▼
+                    ┌───────────────────┐
+                    │   Node.js Server  │
+                    │                   │
+                    │ Input Validation  │
+                    │        ↓          │
+                    │ Delta Composition │
+                    │        ↓          │
+                    │ Authoritative Doc │
+                    └─────────┬─────────┘
+                              │
+              ┌───────────────┴───────────────┐
+              │                               │
+              ▼                               ▼
+     ┌─────────────────┐             ┌─────────────────┐
+     │  Socket.IO      │             │      Redis      │
+     │ Broadcast Delta │             │ Document State  │
+     └────────┬────────┘             │ 24h TTL         │
+              │                      └─────────────────┘
+              │
+       ┌──────┴──────┐
+       ▼             ▼
+┌─────────────┐ ┌─────────────┐
+│  Client B   │ │  Client C   │
+│ React+Quill │ │ React+Quill │
+└─────────────┘ └─────────────┘
 ```
-Client A types → emit delta A → server composes onto authoritative state → broadcast to peers
-Client B types → emit delta B → server composes onto authoritative state → broadcast to peers
-                                ↓
-                         Redis save = server's composed state (not A or B's version)
+
+## How It Works
+
+### 1. Client Editing
+
+When a user modifies the document, Quill generates a **Delta** describing the change.
+
+```text
+User Edit
+   ↓
+Quill Delta
+   ↓
+Socket.IO
+   ↓
+Node.js Server
 ```
 
-**Debounced server-initiated save**
+### 2. Server-Side Delta Composition
 
-The save responsibility was moved entirely server-side. On each `text-change`, the server resets a per-document 2-second debounce timer. When the doc goes quiet, the server emits a `request-save` event to one client — the one whose change triggered the quiet period — and that client responds with the current contents. This collapses N concurrent saves into one regardless of how many users are active.
+The server maintains an authoritative Delta for each active document.
 
-**Redis key namespacing and TTL**
+Each incoming change is composed onto the current document state before being broadcast to other connected clients.
 
-Document content keys are stored as `doc:{id}` and user lists as `users:{id}`. Without this separation, a document with ID `users:abc` would silently overwrite the user list for document `abc`. Every write also refreshes a 24-hour TTL, so inactive documents are automatically evicted without manual cleanup.
+```text
+Client A → Delta A ─┐
+                    ├→ Server → Compose → Authoritative State
+Client B → Delta B ─┘                         ↓
+                                       Broadcast Changes
+```
 
-**Socket-boundary input validation**
+This prevents the server from acting as a simple relay and ensures persistence is based on the server's current document state.
 
-All payloads entering the server — `docId`, `username`, `delta`, and cursor `range` — are validated at the socket event boundary before any Redis or broadcast operation. `docId` is constrained to `[a-zA-Z0-9_-]{1,64}`, deltas must carry a valid `ops` array, and usernames are trimmed and capped at 50 characters. This prevents malformed data from propagating into storage or peer clients.
+### 3. Debounced Persistence
 
-**Reconnection resilience**
+The server maintains a **2-second debounce timer per document**.
 
-The client `get-doc` emit is attached to the socket's `connect` event rather than being fired once on mount. If the socket drops and reconnects, the editor automatically rejoins the document room and reloads the current state — users see a seamless resume rather than a broken editor.
+Every new edit resets the timer. Once editing becomes idle, the server initiates a save operation.
+
+```text
+Edit ─────┐
+Edit ─────┤
+Edit ─────┤── Reset Timer
+Edit ─────┤
+          └──── 2 sec idle → Save
+```
+
+This reduces unnecessary repeated persistence operations when several users are actively editing.
+
+### 4. Redis Storage
+
+Redis stores document state using namespaced keys:
+
+```text
+doc:{documentId}
+users:{documentId}
+```
+
+Document writes refresh a **24-hour TTL**, allowing inactive documents to expire automatically.
+
+### 5. Reconnection Handling
+
+The client registers document initialization against the Socket.IO `connect` event.
+
+When a connection is interrupted:
+
+```text
+Connection Lost
+      ↓
+Socket.IO Reconnect
+      ↓
+Rejoin Document
+      ↓
+Reload Current State
+      ↓
+Resume Editing
+```
+
+## Tech Stack
+
+| Layer                   | Technology              |
+| ----------------------- | ----------------------- |
+| Frontend                | React                   |
+| Editor                  | Quill.js                |
+| Backend                 | Node.js                 |
+| Real-Time Communication | Socket.IO               |
+| Persistence             | Redis                   |
+| Containerization        | Docker / Docker Compose |
+
+## Project Structure
+
+```text
+real-time-editor-app/
+├── frontend/
+│   ├── src/
+│   ├── package.json
+│   └── ...
+├── server/
+│   ├── index.js
+│   ├── utils/
+│   │   └── redisAPI.js
+│   ├── package.json
+│   └── ...
+├── docker-compose.yml
+└── README.md
+```
+
+## Getting Started
+
+### Prerequisites
+
+* Node.js
+* npm
+* Docker and Docker Compose
+
+### Clone the Repository
+
+```bash
+git clone https://github.com/sergij14/real-time-editor-app.git
+cd real-time-editor-app
+```
+
+### Run with Docker
+
+```bash
+docker-compose up --build
+```
+
+The application can then be accessed through the frontend service exposed by Docker.
+
+### Run Locally
+
+Install dependencies for both the frontend and server:
+
+```bash
+cd frontend
+npm install
+```
+
+```bash
+cd ../server
+npm install
+```
+
+Start the backend and frontend using their respective npm scripts.
+
+## Concurrency Model
+
+The system uses a **server-authoritative model** rather than allowing clients to independently decide the final document state.
+
+```text
+                   Incoming Delta
+                         │
+                         ▼
+                ┌─────────────────┐
+                │ Validate Input  │
+                └────────┬────────┘
+                         ▼
+                ┌─────────────────┐
+                │ Compose Delta   │
+                │ with Current    │
+                │ Document State  │
+                └────────┬────────┘
+                         ▼
+                ┌─────────────────┐
+                │ Authoritative   │
+                │ Document State  │
+                └────────┬────────┘
+                         ▼
+                ┌─────────────────┐
+                │ Broadcast to    │
+                │ Connected Users │
+                └─────────────────┘
+```
+
